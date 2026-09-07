@@ -26,9 +26,9 @@ echo ""
 # ── Step 1: Activate virtual environment ─────────────────────────
 echo "→ Activating virtual environment..."
 if [ ! -f ".venv/bin/activate" ]; then
-    echo "✗  Virtual environment not found at ./venv"
+    echo "✗  Virtual environment not found at ./.venv"
     echo "   Run this first:"
-    echo "   python3 -m venv venv && source venv/bin/activate"
+    echo "   python3 -m venv .venv && source .venv/bin/activate"
     echo "   pip install playwright beautifulsoup4 pandas python-dateutil"
     echo "   playwright install chromium"
     echo ""
@@ -89,7 +89,7 @@ else
         exit 1
     fi
 
-    git push
+    git push origin main
     if [ $? -ne 0 ]; then
         echo ""
         echo "✗  Git push failed."
