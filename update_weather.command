@@ -29,8 +29,7 @@ if [ ! -f ".venv/bin/activate" ]; then
     echo "✗  Virtual environment not found at ./.venv"
     echo "   Run this first:"
     echo "   python3 -m venv .venv && source .venv/bin/activate"
-    echo "   pip install playwright beautifulsoup4 pandas python-dateutil"
-    echo "   playwright install chromium"
+    echo "   pip install pandas python-dateutil"
     echo ""
     read -p "Press Enter to close..."
     exit 1
@@ -42,7 +41,6 @@ echo ""
 # ── Step 2: Run the scraper ───────────────────────────────────────
 echo "→ Running Weather Underground scraper..."
 echo "   (Auto-detecting last date from CSV — no input needed)"
-echo "   (A browser window will open — you can minimise it)"
 echo ""
 
 # Pipe an empty line to auto-accept the default start date.

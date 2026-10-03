@@ -2,41 +2,76 @@
 Weather Underground PWS Scraper
 Station: IMILLM1 (Cypress Gardens, Queensland)
 
-Asks for a start date at runtime, scrapes to today, and saves to CSV.
-If an existing CSV is provided it merges new data in, overwriting any
-days that already exist and appending new ones.
+Asks for a start date at runtime, pulls data up to today, and saves to CSV.
+If an existing CSV is present it merges new data in, overwriting any days
+that already exist and appending new ones.
+
+Data source
+-----------
+Weather Underground replaced its website with a new single-page app in
+2026. The new dashboard no longer renders the monthly "Table" view at all,
+so the old approach (drive a browser, click the Table tab, parse the HTML
+table) has nothing left to parse.
+
+Instead we call the same JSON API the site itself uses:
+
+    https://api.weather.com/v2/pws/history/daily
+        ?stationId=...&format=json&units=e
+        &startDate=YYYYMMDD&endDate=YYYYMMDD&apiKey=...
+
+This needs no browser and no HTML parsing, so it is both much faster and
+far less likely to break the next time the site is restyled. Values are
+requested in imperial units and converted here, which reproduces exactly
+what the old table-scraping code recorded.
 
 Requirements:
-    pip install playwright beautifulsoup4 pandas python-dateutil
-    playwright install chromium
+    pip install pandas python-dateutil
 
 Usage:
     python wunderground_scraper.py
 """
 
+import json
+import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
+from calendar import monthrange
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
 import pandas as pd
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 STATION_ID  = "IMILLM1"
 OUTPUT_FILE = "IMILLM1_weather_data.csv"
-DELAY_SECS  = 3
+DELAY_SECS  = 1
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def parse_num(text: str):
-    text = text.replace("\xa0", "").strip()
-    if text in ("--", "", "N/A"):
-        return None
-    m = re.search(r"[-+]?\d+\.?\d*", text)
-    return float(m.group()) if m else None
+HISTORY_URL = "https://api.weather.com/v2/pws/history/daily"
 
+# The site embeds its own API key in its page source — we scrape it rather
+# than hardcode it here, since it is not ours to publish and the site can
+# rotate it at any time. The key we find is cached locally (API_KEY_CACHE,
+# gitignored) so normal runs don't have to re-fetch the page every time.
+API_KEY_CACHE = ".wu_api_key_cache"
+
+# The classic site is still served when this cookie is set, and its page
+# source is where the API key is easiest to find.
+LEGACY_PAGE   = f"https://www.wunderground.com/dashboard/pws/{STATION_ID}"
+LEGACY_COOKIE = "wu_prefer_legacy=true"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36"
+)
+
+# The API rejects ranges longer than about a month, so we request one
+# calendar month per call.
+
+# ── Unit conversion ────────────────────────────────────────────────────────────
 def f_to_c(v):
     return round((v - 32) * 5 / 9, 2) if v is not None else None
 
@@ -49,32 +84,84 @@ def inhg_to_hpa(v):
 def in_to_mm(v):
     return round(v * 25.4, 2) if v is not None else None
 
-def count_date_rows(page) -> int:
-    return page.evaluate("""
-        () => {
-            let count = 0;
-            document.querySelectorAll('td').forEach(td => {
-                if (td.textContent.includes('/')) count++;
-            });
-            return count;
-        }
-    """)
+# ── HTTP ───────────────────────────────────────────────────────────────────────
+def http_get(url: str, cookie: str = None, timeout: int = 30) -> str:
+    """GET a URL and return the body as text. Raises on HTTP errors."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    if cookie:
+        req.add_header("Cookie", cookie)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
-def wait_for_stable_rows(page, timeout=30) -> int:
-    prev_count   = -1
-    stable_ticks = 0
-    deadline     = time.time() + timeout
-    while time.time() < deadline:
-        count = count_date_rows(page)
-        if count > 0 and count == prev_count:
-            stable_ticks += 1
-            if stable_ticks >= 2:
-                return count
-        else:
-            stable_ticks = 0
-        prev_count = count
-        time.sleep(1)
-    return prev_count
+def api_key_works(key: str) -> bool:
+    """Cheap probe: ask for a single recent day and see if we are authorised."""
+    probe_day = (date.today() - relativedelta(days=2)).strftime("%Y%m%d")
+    url = (
+        f"{HISTORY_URL}?stationId={STATION_ID}&format=json&units=e"
+        f"&date={probe_day}&apiKey={key}"
+    )
+    try:
+        http_get(url, timeout=20)
+        return True
+    except urllib.error.HTTPError as e:
+        # 401 means the key is no longer authorised for this product.
+        # Anything else (e.g. 204 no data for that day) means the key is fine.
+        return e.code != 401
+    except Exception:
+        return False
+
+def discover_api_keys() -> list:
+    """Scrape the current API key out of the Weather Underground page source."""
+    try:
+        html = http_get(LEGACY_PAGE, cookie=LEGACY_COOKIE, timeout=40)
+    except Exception as e:
+        print(f"  ⚠  Could not load {LEGACY_PAGE}: {e}")
+        return []
+
+    keys = []
+    # The site defines it as SUN_API_KEY, and also uses it in apiKey=... URLs.
+    for pattern in (r"SUN_API_KEY[^0-9a-f]{0,20}([0-9a-f]{32})",
+                    r"apiKey=([0-9a-f]{32})"):
+        for k in re.findall(pattern, html):
+            if k not in keys:
+                keys.append(k)
+    return keys
+
+def resolve_api_key() -> str:
+    """
+    Return a working API key. Tries the locally cached key first (so most
+    runs make no extra request); if that's missing or no longer works, it
+    re-scrapes the key from the site and refreshes the cache.
+    """
+    cached = None
+    if os.path.exists(API_KEY_CACHE):
+        try:
+            cached = open(API_KEY_CACHE).read().strip() or None
+        except Exception:
+            cached = None
+
+    if cached and api_key_works(cached):
+        return cached
+
+    if cached:
+        print("  ⚠  Cached API key was rejected — looking up the current one...")
+    else:
+        print("  Looking up the current Weather Underground API key...")
+
+    for key in discover_api_keys():
+        if key != cached and api_key_works(key):
+            try:
+                with open(API_KEY_CACHE, "w") as f:
+                    f.write(key)
+            except Exception:
+                pass
+            return key
+
+    print("\n✗  Could not find a working Weather Underground API key.")
+    print("   The site may have changed again. Open this page in a browser,")
+    print("   view source, and search for 'SUN_API_KEY':")
+    print(f"   {LEGACY_PAGE}")
+    sys.exit(1)
 
 # ── Date prompt ────────────────────────────────────────────────────────────────
 def prompt_start_date() -> date:
@@ -84,8 +171,6 @@ def prompt_start_date() -> date:
     Pressing Enter with no input defaults to the last day of data in the
     existing CSV (if it exists), or 5 years ago.
     """
-    import os
-
     default = None
 
     # Try to find the last date in the existing CSV
@@ -128,105 +213,78 @@ def prompt_start_date() -> date:
         except Exception:
             print("  ✗ Invalid format. Please use DD/MM/YYYY (e.g. 01/06/2023)")
 
-# ── Per-month scraper ──────────────────────────────────────────────────────────
-def scrape_month(page, year: int, month: int) -> list[dict]:
+# ── Per-month fetch ────────────────────────────────────────────────────────────
+def scrape_month(api_key: str, year: int, month: int) -> list:
+    """Fetch one calendar month of daily summaries and map them to CSV rows."""
+    first = date(year, month, 1)
+    last  = date(year, month, monthrange(year, month)[1])
+    # Don't ask for days that haven't happened yet.
+    last  = min(last, date.today())
+    if last < first:
+        return []
+
     url = (
-        f"https://www.wunderground.com/dashboard/pws/{STATION_ID}"
-        f"/table/{year}-{month:02d}-01/{year}-{month:02d}-01/monthly"
+        f"{HISTORY_URL}?stationId={STATION_ID}&format=json&units=e"
+        f"&startDate={first:%Y%m%d}&endDate={last:%Y%m%d}&apiKey={api_key}"
     )
 
-    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-    time.sleep(5)
-
-    # Click the Table tab
     try:
-        tab = page.locator("a", has_text="Table").first
-        tab.scroll_into_view_if_needed()
-        tab.click(force=True)
-    except Exception:
-        try:
-            page.evaluate("""
-                const links = Array.from(document.querySelectorAll('a'));
-                const tab = links.find(l => l.textContent.trim() === 'Table');
-                if (tab) tab.click();
-            """)
-        except Exception:
-            pass
+        body = http_get(url, timeout=40)
+    except urllib.error.HTTPError as e:
+        if e.code == 204:           # no observations for this range
+            return []
+        raise
 
-    stable_count = wait_for_stable_rows(page, timeout=30)
-    if stable_count == 0:
+    if not body.strip():
         return []
 
-    html = page.content()
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Find Table 4 — must have a date AND many data columns
-    daily_table = None
-    for table in soup.find_all("table"):
-        data_rows = [r for r in table.find_all("tr") if r.find("td")]
-        if not data_rows:
-            continue
-        cells = data_rows[0].find_all("td")
-        if len(cells) < 10:
-            continue
-        if "/" in cells[0].get_text():
-            daily_table = table
-            break
-
-    if daily_table is None:
-        return []
+    observations = json.loads(body).get("observations") or []
 
     rows = []
-    for tr in daily_table.find_all("tr"):
-        cells = tr.find_all("td")
-        if not cells:
-            continue
-        values = [td.get_text(strip=True).replace("\xa0", "") for td in cells]
-        if not values or "/" not in values[0]:
-            continue
+    for obs in observations:
+        imp = obs.get("imperial") or {}
 
-        nums = [parse_num(v) for v in values]
-        def n(i): return nums[i] if i < len(nums) else None
+        def i(field):
+            return imp.get(field)
 
-        # Convert US date M/D/YYYY → DD/MM/YYYY
-        raw_date = values[0]
+        # obsTimeLocal looks like "2026-09-09 23:59:59"
+        local = obs.get("obsTimeLocal") or ""
         try:
-            parts = raw_date.split('/')
-            au_date = f"{int(parts[1]):02d}/{int(parts[0]):02d}/{parts[2]}"
+            y, m, d = local[:10].split("-")
+            au_date = f"{int(d):02d}/{int(m):02d}/{y}"
+            row_year, row_month = int(y), int(m)
         except Exception:
-            au_date = raw_date
+            continue
 
         rows.append({
             "Date":               au_date,
-            "Year":               year,
-            "Month":              month,
-            "Temp_High_C":        f_to_c(n(1)),
-            "Temp_Avg_C":         f_to_c(n(2)),
-            "Temp_Low_C":         f_to_c(n(3)),
-            "DewPoint_High_C":    f_to_c(n(4)),
-            "DewPoint_Avg_C":     f_to_c(n(5)),
-            "DewPoint_Low_C":     f_to_c(n(6)),
-            "Humidity_High_pct":  n(7),
-            "Humidity_Avg_pct":   n(8),
-            "Humidity_Low_pct":   n(9),
-            "WindSpeed_High_kmh": mph_to_kmh(n(10)),
-            "WindSpeed_Avg_kmh":  mph_to_kmh(n(11)),
-            "WindSpeed_Low_kmh":  mph_to_kmh(n(12)),
-            "Pressure_High_hPa":  inhg_to_hpa(n(13)),
-            "Pressure_Low_hPa":   inhg_to_hpa(n(14)),
-            "Precip_Total_mm":    in_to_mm(n(15)),
+            "Year":               row_year,
+            "Month":              row_month,
+            "Temp_High_C":        f_to_c(i("tempHigh")),
+            "Temp_Avg_C":         f_to_c(i("tempAvg")),
+            "Temp_Low_C":         f_to_c(i("tempLow")),
+            "DewPoint_High_C":    f_to_c(i("dewptHigh")),
+            "DewPoint_Avg_C":     f_to_c(i("dewptAvg")),
+            "DewPoint_Low_C":     f_to_c(i("dewptLow")),
+            "Humidity_High_pct":  obs.get("humidityHigh"),
+            "Humidity_Avg_pct":   obs.get("humidityAvg"),
+            "Humidity_Low_pct":   obs.get("humidityLow"),
+            "WindSpeed_High_kmh": mph_to_kmh(i("windspeedHigh")),
+            "WindSpeed_Avg_kmh":  mph_to_kmh(i("windspeedAvg")),
+            "WindSpeed_Low_kmh":  mph_to_kmh(i("windspeedLow")),
+            "Pressure_High_hPa":  inhg_to_hpa(i("pressureMax")),
+            "Pressure_Low_hPa":   inhg_to_hpa(i("pressureMin")),
+            "Precip_Total_mm":    in_to_mm(i("precipTotal")),
         })
 
     return rows
 
 # ── Merge with existing CSV ────────────────────────────────────────────────────
-def merge_with_existing(new_rows: list[dict]) -> pd.DataFrame:
+def merge_with_existing(new_rows: list) -> pd.DataFrame:
     """
     Load existing CSV (if any), merge new rows in.
     New data overwrites existing rows with the same date.
     """
-    import os
-
     new_df = pd.DataFrame(new_rows)
 
     if not os.path.exists(OUTPUT_FILE):
@@ -283,42 +341,30 @@ def main():
     print(f"\n  Scraping : {start_date.strftime('%d/%m/%Y')} → today")
     print(f"  Months   : {total_months}")
     print(f"  Units    : Metric (°C, km/h, hPa, mm)")
-    print(f"\n  A browser window will open — you can minimise it.")
-    print(f"  Do NOT close it until Done appears below.")
     print(f"{'='*60}\n")
+
+    print("  Checking Weather Underground API access...")
+    api_key = resolve_api_key()
+    print("  ✓ API access OK\n")
 
     all_rows = []
     current  = start_date
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
-        )
-        page = context.new_page()
+    month_num = 0
+    while current <= end_date:
+        month_num += 1
+        print(f"[{month_num:02d}/{total_months}] {current.year}-{current.month:02d} ...", end=" ", flush=True)
 
-        month_num = 0
-        while current <= end_date:
-            month_num += 1
-            print(f"[{month_num:02d}/{total_months}] {current.year}-{current.month:02d} ...", end=" ", flush=True)
+        try:
+            rows = scrape_month(api_key, current.year, current.month)
+            all_rows.extend(rows)
+            print(f"✓ {len(rows)} days" if rows else "○ no data")
+        except Exception as e:
+            print(f"✗ {e}")
 
-            try:
-                rows = scrape_month(page, current.year, current.month)
-                all_rows.extend(rows)
-                print(f"✓ {len(rows)} days" if rows else "○ no data")
-            except Exception as e:
-                print(f"✗ {e}")
-
-            current += relativedelta(months=1)
-            if current <= end_date:
-                time.sleep(DELAY_SECS)
-
-        browser.close()
+        current += relativedelta(months=1)
+        if current <= end_date:
+            time.sleep(DELAY_SECS)
 
     if not all_rows:
         print("\n⚠  No data collected.")
