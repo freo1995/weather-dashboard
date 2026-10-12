@@ -223,8 +223,12 @@ def scrape_month(api_key: str, year: int, month: int) -> list:
     if last < first:
         return []
 
+    # numericPrecision=decimal matters: without it the API rounds temperature
+    # and wind speed to whole °F / mph, which is far coarser than the 0.1 °F
+    # the rest of the CSV was recorded at.
     url = (
         f"{HISTORY_URL}?stationId={STATION_ID}&format=json&units=e"
+        f"&numericPrecision=decimal"
         f"&startDate={first:%Y%m%d}&endDate={last:%Y%m%d}&apiKey={api_key}"
     )
 
